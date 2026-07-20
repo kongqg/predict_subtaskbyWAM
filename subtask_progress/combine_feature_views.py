@@ -1,4 +1,4 @@
-"""Concatenate per-view feature parquets into one feature stream."""
+"""Combine per-view feature parquets into one feature stream."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ def main() -> None:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--feature-root", action="append", required=True)
     parser.add_argument("--feature-column", default="visual_features")
+    parser.add_argument("--mode", choices=["concat", "stack"], default="concat")
+    parser.add_argument("--output-format", choices=["parquet", "npy"], default="parquet")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -32,7 +34,7 @@ def main() -> None:
 
     written = []
     for first in first_files:
-        out_path = out_data / first.name
+        out_path = out_data / (first.with_suffix(".npy").name if args.output_format == "npy" else first.name)
         if out_path.exists() and not args.overwrite:
             written.append(int(first.stem.split("_")[-1]))
             continue
@@ -43,20 +45,33 @@ def main() -> None:
             if len(df) != len(dfs[0]) or not np.array_equal(df["frame_index"].to_numpy(), frame_index):
                 raise ValueError(f"frame mismatch in {root / 'data' / 'chunk-000' / first.name}")
 
-        features = []
-        for row_values in zip(*(df[args.feature_column].to_list() for df in dfs)):
-            features.append(np.concatenate([np.asarray(x, dtype=np.float32) for x in row_values]))
+        view_arrays = [
+            np.stack([np.asarray(x, dtype=np.float32) for x in df[args.feature_column].to_list()], axis=0)
+            for df in dfs
+        ]
+        array = np.concatenate(view_arrays, axis=1) if args.mode == "concat" else np.stack(view_arrays, axis=1)
 
-        tmp_path = out_path.with_suffix(".tmp.parquet")
-        pd.DataFrame({"frame_index": frame_index, args.feature_column: features}).to_parquet(tmp_path)
-        tmp_path.replace(out_path)
+        if args.output_format == "npy":
+            tmp_path = out_path.with_suffix(".tmp.npy")
+            with open(tmp_path, "wb") as f:
+                np.save(f, array)
+            tmp_path.replace(out_path)
+            frames = int(array.shape[0])
+        else:
+            features = [x for x in array] if args.mode == "concat" else [x.tolist() for x in array]
+            tmp_path = out_path.with_suffix(".tmp.parquet")
+            pd.DataFrame({"frame_index": frame_index, args.feature_column: features}).to_parquet(tmp_path)
+            tmp_path.replace(out_path)
+            frames = len(features)
         episode_index = int(first.stem.split("_")[-1])
         written.append(episode_index)
-        print(json.dumps({"episode_index": episode_index, "frames": len(features)}, ensure_ascii=False), flush=True)
+        print(json.dumps({"episode_index": episode_index, "frames": frames}, ensure_ascii=False), flush=True)
 
     info: dict[str, Any] = {
         "source_feature_roots": [str(root) for root in roots],
         "feature_column": args.feature_column,
+        "mode": args.mode,
+        "output_format": args.output_format,
         "num_views": len(roots),
         "episodes": sorted(written),
     }

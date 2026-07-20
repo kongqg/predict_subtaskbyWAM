@@ -31,7 +31,7 @@ def main() -> None:
     visual_dim, proprio_dim = dataset.infer_dims()
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-    model_cfg_dict = ckpt.get("model_config") or vars(build_model_config(cfg, visual_dim, proprio_dim))
+    model_cfg_dict = ckpt.get("model_config") or vars(build_model_config(cfg, visual_dim, proprio_dim, dataset.infer_num_views()))
     model = SubtaskProgressTransformer(SubtaskProgressTransformerConfig(**model_cfg_dict)).to(device)
     model.load_state_dict(ckpt["model"])
 

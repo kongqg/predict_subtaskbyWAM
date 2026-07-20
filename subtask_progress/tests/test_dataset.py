@@ -64,6 +64,20 @@ def _make_feature_root(tmp_path: Path) -> Path:
     return root
 
 
+def _make_view_feature_root(tmp_path: Path, view_idx: int, length: int = 5, frame_offset: int = 0) -> Path:
+    root = tmp_path / f"features_view_{view_idx}"
+    chunk = root / "data" / "chunk-000"
+    chunk.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(
+        {
+            "frame_index": [t + frame_offset for t in range(length)],
+            "visual_features": [np.asarray([view_idx, t], dtype=np.float32) for t in range(length)],
+        }
+    )
+    df.to_parquet(chunk / "episode_000000.parquet")
+    return root
+
+
 def test_dataset_does_not_read_future_frames(tmp_path):
     ds = SubtaskProgressDataset(_make_root(tmp_path), "visual", history_length=3)
     idx = ds.samples.index((0, 2))
@@ -117,6 +131,25 @@ def test_done_ignore_window_masks_ambiguous_frames(tmp_path):
     assert ds[ds.samples.index((0, 4))]["done_loss_mask"].item() == 0.0
 
 
+def test_done_hard_negative_window_weights_pre_done_frames(tmp_path):
+    root = _make_root(tmp_path)
+    ann = tmp_path / "done.jsonl"
+    ann.write_text(json.dumps({"episode_index": 0, "done_start_frame": 3}) + "\n")
+    ds = SubtaskProgressDataset(
+        root,
+        "visual",
+        history_length=3,
+        done_label_strategy="annotation",
+        done_annotation_path=ann,
+        done_hard_negative_window=2,
+        done_hard_negative_weight=3.0,
+    )
+    assert ds[ds.samples.index((0, 0))]["done_loss_mask"].item() == 1.0
+    assert ds[ds.samples.index((0, 1))]["done_loss_mask"].item() == 3.0
+    assert ds[ds.samples.index((0, 2))]["done_loss_mask"].item() == 3.0
+    assert ds[ds.samples.index((0, 3))]["done_loss_mask"].item() == 1.0
+
+
 def test_done_positive_delay_shifts_annotation_label(tmp_path):
     root = _make_root(tmp_path)
     ann = tmp_path / "done.jsonl"
@@ -131,3 +164,37 @@ def test_done_positive_delay_shifts_annotation_label(tmp_path):
     )
     assert ds[ds.samples.index((0, 3))]["target_done"].item() == 0.0
     assert ds[ds.samples.index((0, 4))]["target_done"].item() == 1.0
+
+
+def test_dataset_reads_aligned_feature_roots_and_view_dropout(tmp_path):
+    roots = [_make_view_feature_root(tmp_path, i) for i in range(4)]
+    ds = SubtaskProgressDataset(
+        _make_root(tmp_path),
+        "visual_features",
+        history_length=3,
+        feature_roots=roots,
+        view_dropout_prob=0.99,
+        view_dropout_enabled=True,
+        seed=0,
+    )
+    sample = ds[ds.samples.index((0, 2))]
+    assert sample["visual_features"].shape == (3, 4, 2)
+    assert sample["start_visual"].shape == (4, 2)
+    assert sample["view_mask"][:2].any()
+
+
+def test_dataset_rejects_misaligned_feature_roots(tmp_path):
+    roots = [_make_view_feature_root(tmp_path, i) for i in range(4)]
+    roots[2] = _make_view_feature_root(tmp_path, 20, frame_offset=1)
+    ds = SubtaskProgressDataset(
+        _make_root(tmp_path),
+        "visual_features",
+        history_length=3,
+        feature_roots=roots,
+    )
+    try:
+        ds[ds.samples.index((0, 2))]
+    except ValueError as exc:
+        assert "frame_index mismatch" in str(exc)
+    else:
+        raise AssertionError("expected feature alignment failure")

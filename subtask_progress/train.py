@@ -37,7 +37,7 @@ def main() -> None:
     train_ds = build_dataset(cfg, "train", tiny_overfit=args.tiny_overfit)
     val_ds = build_dataset(cfg, "val", tiny_overfit=args.tiny_overfit)
     visual_dim, proprio_dim = train_ds.infer_dims()
-    model_cfg = build_model_config(cfg, visual_dim, proprio_dim)
+    model_cfg = build_model_config(cfg, visual_dim, proprio_dim, train_ds.infer_num_views())
     model = SubtaskProgressTransformer(model_cfg).to(device)
     loss_fn = ProgressLoss(**cfg.get("loss", {})).to(device)
     optim = torch.optim.AdamW(
@@ -95,6 +95,7 @@ def main() -> None:
                 batch["task_ids"],
                 batch["proprio"],
                 batch["padding_mask"],
+                batch.get("view_mask"),
             )
             losses = loss_fn(
                 output["progress"],
@@ -192,6 +193,12 @@ def build_dataset(cfg: dict[str, Any], split: str, tiny_overfit: bool = False) -
     feature_root = ds_cfg.get("feature_root")
     if isinstance(feature_root, dict):
         ds_cfg["feature_root"] = feature_root.get(split)
+    feature_roots = ds_cfg.get("feature_roots")
+    if isinstance(feature_roots, dict):
+        ds_cfg["feature_roots"] = feature_roots.get(split)
+    if ds_cfg.get("feature_roots") or int(cfg.get("model", {}).get("num_views") or 1) > 1:
+        ds_cfg.setdefault("view_dropout_prob", 0.25)
+        ds_cfg["view_dropout_enabled"] = bool(split == "train" and ds_cfg.get("view_dropout_enabled", True))
     ds_cfg.setdefault("history_length", int(cfg["model"]["history_length"]))
     if tiny_overfit:
         ds_cfg["max_samples"] = int(cfg.get("tiny_overfit", {}).get("max_samples", 32))
@@ -201,10 +208,11 @@ def build_dataset(cfg: dict[str, Any], split: str, tiny_overfit: bool = False) -
 
 
 def build_model_config(
-    cfg: dict[str, Any], inferred_visual_dim: int, inferred_proprio_dim: int
+    cfg: dict[str, Any], inferred_visual_dim: int, inferred_proprio_dim: int, inferred_num_views: int = 1
 ) -> SubtaskProgressTransformerConfig:
     model_cfg = dict(cfg["model"])
     model_cfg["visual_dim"] = int(model_cfg.get("visual_dim") or inferred_visual_dim)
+    model_cfg["num_views"] = int(model_cfg.get("num_views") or inferred_num_views)
     model_cfg["proprio_dim"] = int(
         inferred_proprio_dim if model_cfg.get("proprio_dim") is None else model_cfg["proprio_dim"]
     )
@@ -223,22 +231,27 @@ def predict_rows(model: SubtaskProgressTransformer, loader: DataLoader, device: 
                 batch["task_ids"],
                 batch["proprio"],
                 batch["padding_mask"],
+                batch.get("view_mask"),
             )
             done_prob = torch.sigmoid(output["done_logit"])
             done_loss_mask = batch.get("done_loss_mask", torch.ones_like(batch["target_done"]))
+            view_attention = output.get("view_attention")
             for i in range(output["progress"].shape[0]):
-                rows.append(
-                    {
-                        "pred_progress": float(output["progress"][i].cpu()),
-                        "target_progress": float(batch["target_progress"][i].cpu()),
-                        "done_probability": float(done_prob[i].cpu()),
-                        "target_done": float(batch["target_done"][i].cpu()),
-                        "done_loss_mask": float(done_loss_mask[i].cpu()),
-                        "task_id": int(batch["task_ids"][i].cpu()),
-                        "segment_id": int(batch["segment_ids"][i].cpu()),
-                        "frame_index": int(batch["frame_index"][i].cpu()),
-                    }
-                )
+                row = {
+                    "pred_progress": float(output["progress"][i].cpu()),
+                    "target_progress": float(batch["target_progress"][i].cpu()),
+                    "done_probability": float(done_prob[i].cpu()),
+                    "target_done": float(batch["target_done"][i].cpu()),
+                    "done_loss_mask": float(done_loss_mask[i].cpu()),
+                    "task_id": int(batch["task_ids"][i].cpu()),
+                    "segment_id": int(batch["segment_ids"][i].cpu()),
+                    "frame_index": int(batch["frame_index"][i].cpu()),
+                }
+                if view_attention is not None:
+                    valid = ~batch["padding_mask"][i].bool()
+                    attn = view_attention[i, valid].mean(dim=0)
+                    row["view_attention"] = [float(x) for x in attn.cpu()]
+                rows.append(row)
     return rows
 
 

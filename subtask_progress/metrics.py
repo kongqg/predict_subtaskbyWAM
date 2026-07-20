@@ -96,11 +96,20 @@ def summarize_predictions(rows: list[dict[str, Any]], done_threshold: float = 0.
         "done": done_metrics(done_prob[done_mask], done_target[done_mask], done_threshold),
         "per_task": {},
     }
+    if rows and "view_attention" in rows[0]:
+        attn = np.asarray([r["view_attention"] for r in rows], dtype=np.float64)
+        out["view_attention"] = {
+            "mean": attn.mean(axis=0).tolist(),
+            "view_order": ["cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist"][: attn.shape[1]],
+        }
     for task_id in sorted(np.unique(task_ids).tolist()):
         mask = task_ids == task_id
         task_done_mask = mask & done_mask
-        out["per_task"][str(task_id)] = {
+        task_out = {
             "progress": regression_metrics(pred[mask], target[mask]),
             "done": done_metrics(done_prob[task_done_mask], done_target[task_done_mask], done_threshold),
         }
+        if rows and "view_attention" in rows[0]:
+            task_out["view_attention"] = attn[mask].mean(axis=0).tolist()
+        out["per_task"][str(task_id)] = task_out
     return out

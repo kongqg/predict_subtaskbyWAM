@@ -50,3 +50,30 @@ def test_task_id_changes_task_hidden_for_same_inputs():
     start = torch.randn(1, 5).repeat(2, 1)
     out = model(visual, start, torch.tensor([0, 1]))
     assert not torch.allclose(out["task_hidden"][0], out["task_hidden"][1])
+
+
+def test_structured_4view_fusion_outputs_attention():
+    model = SubtaskProgressTransformer(
+        SubtaskProgressTransformerConfig(
+            visual_dim=5,
+            proprio_dim=0,
+            num_tasks=2,
+            num_views=4,
+            history_length=6,
+            d_model=32,
+            num_layers=1,
+            num_heads=4,
+            dim_feedforward=64,
+            dropout=0.0,
+        )
+    )
+    out = model(
+        torch.randn(2, 6, 4, 5),
+        torch.randn(2, 4, 5),
+        torch.tensor([0, 1]),
+        padding_mask=torch.tensor([[True, False, False, False, False, False], [False] * 6]),
+        view_mask=torch.tensor([[True, False, True, True], [False, True, True, False]]),
+    )
+    assert out["progress"].shape == (2,)
+    assert out["view_attention"].shape == (2, 6, 4)
+    assert torch.allclose(out["view_attention"][0, :, 1], torch.zeros(6), atol=1e-6)

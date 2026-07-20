@@ -34,6 +34,7 @@ class SubtaskProgressDataset(Dataset):
         visual_column: str,
         history_length: int,
         feature_root: str | Path | None = None,
+        feature_roots: list[str | Path] | None = None,
         proprio_column: str | None = None,
         task_column: str = "task_index",
         done_column: str | None = None,
@@ -44,6 +45,8 @@ class SubtaskProgressDataset(Dataset):
         done_positive_delay_ratio: float = 0.0,
         done_ignore_before: int = 0,
         done_ignore_after: int = 0,
+        done_hard_negative_window: int = 0,
+        done_hard_negative_weight: float = 1.0,
         segment_end_mode: str = "exclusive",
         frame_stride: int = 1,
         sample_tail_frames: int | None = None,
@@ -55,9 +58,13 @@ class SubtaskProgressDataset(Dataset):
         max_cached_episodes: int = 8,
         seed: int = 0,
         augment: dict[str, Any] | None = None,
+        view_dropout_prob: float = 0.0,
+        view_dropout_enabled: bool = False,
+        view_dropout_high_indices: list[int] | None = None,
     ):
         self.root = Path(root)
         self.feature_root = Path(feature_root) if feature_root else None
+        self.feature_roots = [Path(p) for p in (feature_roots or [])]
         self.visual_column = visual_column
         self.proprio_column = proprio_column or None
         self.task_column = task_column
@@ -69,6 +76,8 @@ class SubtaskProgressDataset(Dataset):
         self.done_positive_delay_ratio = float(done_positive_delay_ratio)
         self.done_ignore_before = int(done_ignore_before)
         self.done_ignore_after = int(done_ignore_after)
+        self.done_hard_negative_window = int(done_hard_negative_window)
+        self.done_hard_negative_weight = float(done_hard_negative_weight)
         self.segment_end_mode = segment_end_mode
         self.history_length = int(history_length)
         self.frame_stride = int(frame_stride)
@@ -80,11 +89,19 @@ class SubtaskProgressDataset(Dataset):
         self.max_cached_episodes = int(max_cached_episodes)
         self.rng = random.Random(seed)
         self.augment = augment or {}
+        self.view_dropout_prob = float(view_dropout_prob)
+        self.view_dropout_enabled = bool(view_dropout_enabled)
+        self.view_dropout_high_indices = view_dropout_high_indices or [0, 1]
         self._cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
         self._feature_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
+        self._feature_view_cache: OrderedDict[tuple[int, int], pd.DataFrame] = OrderedDict()
 
         if self.history_length <= 0:
             raise ValueError("history_length must be > 0")
+        if self.feature_root and self.feature_roots:
+            raise ValueError("feature_root and feature_roots are mutually exclusive")
+        if self.view_dropout_prob < 0 or self.view_dropout_prob >= 1:
+            raise ValueError("view_dropout_prob must be in [0, 1)")
         if self.done_label_strategy not in {"last_frame", "last_window", "column", "annotation"}:
             raise ValueError("done_label_strategy must be last_frame, last_window, column, or annotation")
         if self.segment_end_mode not in {"exclusive", "inclusive"}:
@@ -99,6 +116,10 @@ class SubtaskProgressDataset(Dataset):
             raise ValueError("done_positive_delay_ratio must be >= 0")
         if self.done_ignore_before < 0 or self.done_ignore_after < 0:
             raise ValueError("done ignore windows must be >= 0")
+        if self.done_hard_negative_window < 0:
+            raise ValueError("done_hard_negative_window must be >= 0")
+        if self.done_hard_negative_weight <= 0:
+            raise ValueError("done_hard_negative_weight must be > 0")
         if self.sample_tail_frames is not None and self.exclude_tail_frames:
             raise ValueError("sample_tail_frames and exclude_tail_frames are mutually exclusive")
         if self.sample_modulus is not None and self.sample_modulus <= 0:
@@ -110,6 +131,7 @@ class SubtaskProgressDataset(Dataset):
         self.done_start_by_episode = self._load_done_annotations()
         self.parquet_by_episode = self._index_parquets()
         self.feature_by_episode = self._index_features() if self.feature_root else {}
+        self.feature_by_view_episode = self._index_feature_roots() if self.feature_roots else []
         self.segments = self._load_segments()
         self.samples = self._build_samples(max_samples)
 
@@ -121,11 +143,16 @@ class SubtaskProgressDataset(Dataset):
         segment = self.segments[segment_idx]
         df = self._episode_df(segment.episode_index)
         visual_df = self._feature_df(segment.episode_index) if self.feature_root else df
+        visual_dfs = self._feature_view_dfs(segment.episode_index) if self.feature_roots else None
 
         raw_indices = self._history_indices(segment, t)
         indices = self._augment_indices(raw_indices)
-        visual = self._pad_feature(self._stack_feature(visual_df, self.visual_column, indices))
-        start_visual = self._stack_feature(visual_df, self.visual_column, [segment.start])[0]
+        if visual_dfs is not None:
+            visual = self._pad_feature(self._stack_view_features(visual_dfs, self.visual_column, indices))
+            start_visual = self._stack_view_features(visual_dfs, self.visual_column, [segment.start])[0]
+        else:
+            visual = self._pad_feature(self._stack_feature(visual_df, self.visual_column, indices))
+            start_visual = self._stack_feature(visual_df, self.visual_column, [segment.start])[0]
         padding_mask = self._padding_mask(len(indices))
 
         if self.proprio_column:
@@ -137,7 +164,7 @@ class SubtaskProgressDataset(Dataset):
         done = self._done_label(df, segment, t)
         done_loss_mask = self._done_loss_mask(segment, t)
 
-        return {
+        sample = {
             "visual_features": torch.from_numpy(visual),
             "start_visual": torch.from_numpy(start_visual.astype(np.float32)),
             "task_ids": torch.tensor(segment.task_id, dtype=torch.long),
@@ -150,10 +177,18 @@ class SubtaskProgressDataset(Dataset):
             "frame_index": torch.tensor(t, dtype=torch.long),
             "source_episode_index": torch.tensor(segment.source_episode_index, dtype=torch.long),
         }
+        if visual.ndim == 3:
+            sample["view_mask"] = torch.from_numpy(self._view_mask(visual.shape[1]))
+        return sample
 
     def infer_dims(self) -> tuple[int, int]:
         sample = self[0]
         return sample["visual_features"].shape[-1], sample["proprio"].shape[-1]
+
+    def infer_num_views(self) -> int:
+        sample = self[0]
+        visual = sample["visual_features"]
+        return int(visual.shape[-2]) if visual.ndim == 3 else 1
 
     def _load_info(self) -> dict[str, Any]:
         path = self.root / "meta" / "info.json"
@@ -189,12 +224,29 @@ class SubtaskProgressDataset(Dataset):
     def _index_features(self) -> dict[int, Path]:
         assert self.feature_root is not None
         out: dict[int, Path] = {}
-        for path in sorted((self.feature_root / "data").rglob("*.parquet")):
+        for path in sorted((self.feature_root / "data").rglob("episode_*")):
             stem = path.stem
-            if stem.startswith("episode_"):
+            if stem.startswith("episode_") and path.suffix in {".parquet", ".npy"}:
                 out[int(stem.split("_")[-1])] = path
         if not out:
-            raise FileNotFoundError(f"no feature parquet files under {self.feature_root / 'data'}")
+            raise FileNotFoundError(f"no feature files under {self.feature_root / 'data'}")
+        return out
+
+    def _index_feature_roots(self) -> list[dict[int, Path]]:
+        out = []
+        for root in self.feature_roots:
+            by_episode: dict[int, Path] = {}
+            for path in sorted((root / "data").rglob("*.parquet")):
+                stem = path.stem
+                if stem.startswith("episode_"):
+                    by_episode[int(stem.split("_")[-1])] = path
+            if not by_episode:
+                raise FileNotFoundError(f"no feature parquet files under {root / 'data'}")
+            out.append(by_episode)
+        first = set(out[0])
+        for i, by_episode in enumerate(out[1:], start=1):
+            if set(by_episode) != first:
+                raise ValueError(f"feature_roots are not episode-aligned: view 0 vs view {i}")
         return out
 
     def _load_segments(self) -> list[SegmentInfo]:
@@ -212,6 +264,8 @@ class SubtaskProgressDataset(Dataset):
                 if episode_index not in self.parquet_by_episode:
                     continue
                 if self.feature_root and episode_index not in self.feature_by_episode:
+                    continue
+                if self.feature_roots and any(episode_index not in by_ep for by_ep in self.feature_by_view_episode):
                     continue
                 sub = (row.get("sub_tasks") or [{}])[0]
                 start = int(sub.get("start", 0))
@@ -275,11 +329,48 @@ class SubtaskProgressDataset(Dataset):
         if episode_index in self._feature_cache:
             self._feature_cache.move_to_end(episode_index)
             return self._feature_cache[episode_index]
-        df = pd.read_parquet(self.feature_by_episode[episode_index])
+        path = self.feature_by_episode[episode_index]
+        if path.suffix == ".npy":
+            arr = np.load(path, mmap_mode="r")
+            df = pd.DataFrame(
+                {"frame_index": np.arange(arr.shape[0]), self.visual_column: [arr[i] for i in range(arr.shape[0])]}
+            )
+        else:
+            df = pd.read_parquet(path)
         self._feature_cache[episode_index] = df
         if len(self._feature_cache) > self.max_cached_episodes:
             self._feature_cache.popitem(last=False)
         return df
+
+    def _feature_view_dfs(self, episode_index: int) -> list[pd.DataFrame]:
+        dfs = []
+        for view_idx, by_episode in enumerate(self.feature_by_view_episode):
+            key = (view_idx, episode_index)
+            if key in self._feature_view_cache:
+                self._feature_view_cache.move_to_end(key)
+                dfs.append(self._feature_view_cache[key])
+                continue
+            df = pd.read_parquet(by_episode[episode_index])
+            self._feature_view_cache[key] = df
+            dfs.append(df)
+            if len(self._feature_view_cache) > self.max_cached_episodes * max(len(self.feature_roots), 1):
+                self._feature_view_cache.popitem(last=False)
+        self._check_feature_alignment(episode_index, dfs)
+        return dfs
+
+    def _check_feature_alignment(self, episode_index: int, dfs: list[pd.DataFrame]) -> None:
+        lengths = [len(df) for df in dfs]
+        if len(set(lengths)) != 1:
+            raise ValueError(f"feature_roots length mismatch for episode {episode_index}: {lengths}")
+        if all("frame_index" in df.columns for df in dfs):
+            base = dfs[0]["frame_index"].to_numpy()
+            for view_idx, df in enumerate(dfs[1:], start=1):
+                if not np.array_equal(base, df["frame_index"].to_numpy()):
+                    raise ValueError(f"feature_roots frame_index mismatch for episode {episode_index}, view {view_idx}")
+        if all("episode_index" in df.columns for df in dfs):
+            for view_idx, df in enumerate(dfs):
+                if not np.all(df["episode_index"].to_numpy() == episode_index):
+                    raise ValueError(f"feature_root episode_index mismatch for episode {episode_index}, view {view_idx}")
 
     def _history_indices(self, segment: SegmentInfo, t: int) -> list[int]:
         interval = int(self.augment.get("max_sample_interval", 1))
@@ -324,10 +415,23 @@ class SubtaskProgressDataset(Dataset):
         if column not in df.columns:
             raise KeyError(f"{column!r} not found in parquet columns: {list(df.columns)}")
         values = df.iloc[indices][column].to_list()
-        arr = np.asarray(values, dtype=np.float32)
+        arr = np.stack([self._as_feature_array(value) for value in values], axis=0)
         if arr.ndim == 1:
             arr = arr[:, None]
         return arr
+
+    def _as_feature_array(self, value: Any) -> np.ndarray:
+        arr = np.asarray(value)
+        if arr.dtype == object:
+            arr = np.stack([np.asarray(item, dtype=np.float32) for item in value], axis=0)
+        return arr.astype(np.float32, copy=False)
+
+    def _stack_view_features(self, dfs: list[pd.DataFrame], column: str, indices: list[int]) -> np.ndarray:
+        arrays = [self._stack_feature(df, column, indices) for df in dfs]
+        shapes = [arr.shape for arr in arrays]
+        if len(set(shapes)) != 1:
+            raise ValueError(f"feature_roots shape mismatch for {column}: {shapes}")
+        return np.stack(arrays, axis=1).astype(np.float32)
 
     def _pad_feature(self, arr: np.ndarray) -> np.ndarray:
         arr = arr.astype(np.float32)
@@ -336,8 +440,21 @@ class SubtaskProgressDataset(Dataset):
         pad = self.history_length - arr.shape[0]
         if pad <= 0:
             return arr
-        zeros = np.zeros((pad, arr.shape[1]), dtype=np.float32)
+        zeros = np.zeros((pad, *arr.shape[1:]), dtype=np.float32)
         return np.concatenate([zeros, arr], axis=0)
+
+    def _view_mask(self, num_views: int) -> np.ndarray:
+        mask = np.ones((num_views,), dtype=bool)
+        if self.view_dropout_enabled and self.view_dropout_prob > 0:
+            for i in range(num_views):
+                if self.rng.random() < self.view_dropout_prob:
+                    mask[i] = False
+            high = [i for i in self.view_dropout_high_indices if 0 <= i < num_views]
+            if high and not mask[high].any():
+                mask[self.rng.choice(high)] = True
+            if not mask.any():
+                mask[self.rng.randrange(num_views)] = True
+        return mask
 
     def _padding_mask(self, valid_len: int) -> np.ndarray:
         valid_len = min(valid_len, self.history_length)
@@ -366,12 +483,15 @@ class SubtaskProgressDataset(Dataset):
     def _done_loss_mask(self, segment: SegmentInfo, t: int) -> float:
         if self.done_label_strategy != "annotation":
             return 1.0
-        if self.done_ignore_before == 0 and self.done_ignore_after == 0:
-            return 1.0
         done_start = self._effective_done_start(segment)
-        lo = done_start - self.done_ignore_before
-        hi = done_start + self.done_ignore_after
-        return float(not (lo <= t <= hi))
+        if self.done_ignore_before or self.done_ignore_after:
+            lo = done_start - self.done_ignore_before
+            hi = done_start + self.done_ignore_after
+            if lo <= t <= hi:
+                return 0.0
+        if self.done_hard_negative_window and done_start - self.done_hard_negative_window <= t < done_start:
+            return self.done_hard_negative_weight
+        return 1.0
 
     def _effective_done_start(self, segment: SegmentInfo) -> int:
         raw_done_start = self.done_start_by_episode[segment.episode_index]
