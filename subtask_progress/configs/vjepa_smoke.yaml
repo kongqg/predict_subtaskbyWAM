@@ -1,0 +1,60 @@
+seed: 42
+device: cuda
+output_dir: /datashare/kqg/meeting_room_progress_outputs/vjepa_smoke
+
+model:
+  visual_dim:
+  proprio_dim: 0
+  num_tasks: 13
+  history_length: 8
+  d_model: 64
+  num_layers: 1
+  num_heads: 4
+  dim_feedforward: 128
+  dropout: 0.0
+  activation: gelu
+
+dataset:
+  train_root: /datashare/kqg/meeting_room_code/meeting_room_404_0511_order_success_with_subtask_segmented_split/train
+  val_root: /datashare/kqg/meeting_room_code/meeting_room_404_0511_order_success_with_subtask_segmented_split/val
+  feature_root:
+    train: /datashare/kqg/meeting_room_progress_outputs/vjepa_features_smoke/train
+    val: /datashare/kqg/meeting_room_progress_outputs/vjepa_features_smoke/val
+  visual_column: visual_features
+  proprio_column:
+  task_column: task_index
+  done_column:
+  done_label_strategy: last_window
+  done_window: 3
+  segment_end_mode: exclusive
+  frame_stride: 8
+  max_samples: 64
+  max_cached_episodes: 2
+  seed: 42
+  augment: {}
+
+loss:
+  lambda_progress: 1.0
+  lambda_done: 1.0
+  lambda_rank: 0.0
+  done_pos_weight:
+
+training:
+  batch_size: 2
+  eval_batch_size: 4
+  num_workers: 0
+  max_steps: 5
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  amp: true
+  grad_clip: 1.0
+  log_every: 1
+  eval_every: 5
+  checkpoint_every: 5
+
+evaluation:
+  done_threshold: 0.5
+  num_curve_plots: 2
+
+tiny_overfit:
+  max_samples: 16

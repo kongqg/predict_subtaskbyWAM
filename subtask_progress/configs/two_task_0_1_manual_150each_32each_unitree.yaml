@@ -1,0 +1,72 @@
+seed: 31
+device: cuda
+output_dir: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each_run
+
+model:
+  visual_dim:
+  proprio_dim: 0
+  num_tasks: 2
+  history_length: 32
+  d_model: 128
+  num_layers: 2
+  num_heads: 4
+  dim_feedforward: 512
+  dropout: 0.1
+  activation: gelu
+
+dataset:
+  train_root: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/train/raw
+  val_root: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/val/raw
+  feature_root:
+    train: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/train/features
+    val: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/val/features
+  visual_column: visual_features
+  proprio_column:
+  task_column: task_index
+  done_column:
+  done_label_strategy: annotation
+  done_window: 5
+  done_positive_delay: 0
+  done_ignore_before: 0
+  done_ignore_after: 0
+  segment_end_mode: exclusive
+  frame_stride: 1
+  sample_tail_frames:
+  max_samples:
+  max_cached_episodes: 8
+  seed: 31
+  augment: {}
+
+train_dataset:
+  done_annotation_path: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/annotations/train_done_annotations.jsonl
+
+val_dataset:
+  done_annotation_path: /datashare/kqg/meeting_room_progress_outputs/two_task_0_1_manual_150each_32each/annotations/val_done_annotations.jsonl
+
+loss:
+  lambda_progress: 0.2
+  lambda_done: 1.0
+  lambda_rank: 0.0
+  target_margin: 0.05
+  ranking_margin: 0.02
+  done_pos_weight:
+  max_pairs_per_segment: 1024
+
+training:
+  batch_size: 256
+  eval_batch_size: 512
+  num_workers: 4
+  max_steps: 1500
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  amp: true
+  grad_clip: 1.0
+  log_every: 100
+  eval_every: 500
+  checkpoint_every: 500
+
+evaluation:
+  done_threshold: 0.5
+  done_vote_window: 10
+  done_vote_count: 5
+  num_curve_plots: 8

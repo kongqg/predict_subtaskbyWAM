@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Data / training artifacts
+*.parquet
+*.mp4
+*.avi
+*.mov
+*.pt
+*.pth
+*.ckpt
+*.log
+outputs/
+runs/
+wandb/
+checkpoints/
+models/
+data/
+datasets/
+features/
