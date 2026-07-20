@@ -39,6 +39,7 @@ def main() -> None:
     visual_dim, proprio_dim = train_ds.infer_dims()
     model_cfg = build_model_config(cfg, visual_dim, proprio_dim, train_ds.infer_num_views())
     model = SubtaskProgressTransformer(model_cfg).to(device)
+    wandb_run = init_wandb(cfg, output_dir, model_cfg)
     loss_fn = ProgressLoss(**cfg.get("loss", {})).to(device)
     optim = torch.optim.AdamW(
         model.parameters(),
@@ -117,6 +118,7 @@ def main() -> None:
         if step % log_every == 0 or step == 1:
             row = {"step": step, "lr": current_lr(optim), **{k: float(v) for k, v in losses.items()}}
             append_jsonl(log_path, row)
+            log_wandb(wandb_run, row)
             print(json.dumps(row, ensure_ascii=False))
 
         if step % eval_every == 0 or step == max_steps:
@@ -124,6 +126,7 @@ def main() -> None:
             metrics = summarize_predictions(rows, cfg["evaluation"].get("done_threshold", 0.5))
             mae = metrics["progress"]["mae"]
             write_json(output_dir / "last_eval.json", metrics)
+            log_wandb(wandb_run, flatten_metrics(metrics, prefix="val/") | {"step": step})
             if scheduler is not None and is_plateau_scheduler(scheduler):
                 scheduler.step(mae)
             if mae < best_mae:
@@ -140,6 +143,8 @@ def main() -> None:
             save_checkpoint(
                 output_dir / f"checkpoint_{step}.pt", model, optim, scheduler, step, best_mae, cfg, model_cfg
             )
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def build_lr_scheduler(
@@ -204,6 +209,12 @@ def build_dataset(cfg: dict[str, Any], split: str, tiny_overfit: bool = False) -
         ds_cfg["max_samples"] = int(cfg.get("tiny_overfit", {}).get("max_samples", 32))
         if split == "val":
             root = cfg["dataset"]["train_root"]
+            if isinstance(cfg["dataset"].get("feature_root"), dict):
+                ds_cfg["feature_root"] = cfg["dataset"]["feature_root"].get("train")
+            if isinstance(cfg["dataset"].get("feature_roots"), dict):
+                ds_cfg["feature_roots"] = cfg["dataset"]["feature_roots"].get("train")
+            if cfg.get("train_dataset", {}).get("done_annotation_path"):
+                ds_cfg["done_annotation_path"] = cfg["train_dataset"]["done_annotation_path"]
     return SubtaskProgressDataset(root=root, **ds_cfg)
 
 
@@ -257,6 +268,41 @@ def predict_rows(model: SubtaskProgressTransformer, loader: DataLoader, device: 
 
 def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     return {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+
+
+def init_wandb(
+    cfg: dict[str, Any], output_dir: Path, model_cfg: SubtaskProgressTransformerConfig
+) -> Any | None:
+    wandb_cfg = cfg.get("wandb") or {}
+    if not wandb_cfg.get("enabled", False):
+        return None
+    import wandb
+
+    return wandb.init(
+        project=str(wandb_cfg.get("project", "meeting_room_subtask_progress")),
+        entity=wandb_cfg.get("entity") or None,
+        name=wandb_cfg.get("name") or output_dir.name,
+        dir=str(wandb_cfg.get("dir") or output_dir),
+        mode=str(wandb_cfg.get("mode", "offline")),
+        config={"config": cfg, "model_config": vars(model_cfg)},
+        resume="allow",
+    )
+
+
+def log_wandb(run: Any | None, row: dict[str, Any]) -> None:
+    if run is not None:
+        run.log(row, step=int(row["step"]))
+
+
+def flatten_metrics(metrics: dict[str, Any], prefix: str = "") -> dict[str, float]:
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(flatten_metrics(value, f"{name}/"))
+        elif isinstance(value, (int, float)):
+            out[name] = float(value)
+    return out
 
 
 def save_checkpoint(
