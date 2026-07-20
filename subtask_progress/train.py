@@ -230,19 +230,32 @@ def build_model_config(
     return SubtaskProgressTransformerConfig(**model_cfg)
 
 
-def predict_rows(model: SubtaskProgressTransformer, loader: DataLoader, device: torch.device) -> list[dict[str, Any]]:
+def predict_rows(
+    model: SubtaskProgressTransformer,
+    loader: DataLoader,
+    device: torch.device,
+    mask_view: int | None = None,
+) -> list[dict[str, Any]]:
     model.eval()
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
         for batch in loader:
             batch = to_device(batch, device)
+            view_mask = batch.get("view_mask")
+            if mask_view is not None and view_mask is not None:
+                view_mask = view_mask.clone()
+                if not 0 <= mask_view < view_mask.shape[1]:
+                    raise ValueError(f"mask_view must be in [0, {view_mask.shape[1]})")
+                view_mask[:, mask_view] = False
+                if not view_mask.any(dim=1).all():
+                    raise ValueError("mask_view removed all available views")
             output = model(
                 batch["visual_features"],
                 batch["start_visual"],
                 batch["task_ids"],
                 batch["proprio"],
                 batch["padding_mask"],
-                batch.get("view_mask"),
+                view_mask,
             )
             done_prob = torch.sigmoid(output["done_logit"])
             done_loss_mask = batch.get("done_loss_mask", torch.ones_like(batch["target_done"]))
@@ -260,8 +273,15 @@ def predict_rows(model: SubtaskProgressTransformer, loader: DataLoader, device: 
                 }
                 if view_attention is not None:
                     valid = ~batch["padding_mask"][i].bool()
-                    attn = view_attention[i, valid].mean(dim=0)
-                    row["view_attention"] = [float(x) for x in attn.cpu()]
+                    current_idx = torch.nonzero(valid, as_tuple=False).flatten()[-1]
+                    history_attn = view_attention[i, valid].mean(dim=0)
+                    current_attn = view_attention[i, current_idx]
+                    entropy = -(current_attn * current_attn.clamp_min(1e-12).log()).sum()
+                    entropy = entropy / torch.log(current_attn.new_tensor(current_attn.numel()))
+                    row["view_attention"] = [float(x) for x in history_attn.cpu()]
+                    row["view_attention_history_mean"] = row["view_attention"]
+                    row["view_attention_current"] = [float(x) for x in current_attn.cpu()]
+                    row["view_attention_entropy_current"] = float(entropy.cpu())
                 rows.append(row)
     return rows
 

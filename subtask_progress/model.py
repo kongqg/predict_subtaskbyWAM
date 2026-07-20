@@ -21,6 +21,11 @@ class SubtaskProgressTransformerConfig:
     dim_feedforward: int = 1024
     dropout: float = 0.1
     activation: str = "gelu"
+    done_verifier_enabled: bool = False
+    done_history_length: int = 8
+    done_num_layers: int = 1
+    done_num_heads: int = 0
+    done_dim_feedforward: int = 0
 
 
 class _Head(nn.Module):
@@ -37,6 +42,74 @@ class _Head(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.net(x).squeeze(-1)
         return torch.sigmoid(y) if self.sigmoid else y
+
+
+class _DoneVerifier(nn.Module):
+    """Independent done classifier over the latest multi-view visual tokens."""
+
+    def __init__(self, config: SubtaskProgressTransformerConfig):
+        super().__init__()
+        if config.num_views <= 1:
+            raise ValueError("done verifier requires structured multi-view input")
+        if config.done_history_length <= 0:
+            raise ValueError("done_history_length must be > 0")
+        heads = config.done_num_heads or config.num_heads
+        ff = config.done_dim_feedforward or config.dim_feedforward
+        self.history_length = config.done_history_length
+        self.visual_norm = nn.LayerNorm(config.visual_dim)
+        self.visual_projection = nn.Linear(config.visual_dim, config.d_model)
+        self.view_embedding = nn.Embedding(config.num_views, config.d_model)
+        self.temporal_position_embedding = nn.Embedding(config.done_history_length, config.d_model)
+        self.task_embedding = nn.Embedding(config.num_tasks, config.d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=heads,
+            dim_feedforward=ff,
+            dropout=config.dropout,
+            activation=config.activation,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=config.done_num_layers)
+        self.head = _Head(config.d_model, config.dropout, sigmoid=False)
+
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        task_ids: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+        view_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        recent = visual_features[:, -self.history_length :]
+        batch, steps, views = recent.shape[:3]
+        tokens = self.visual_projection(self.visual_norm(recent))
+        view_embed = self.view_embedding.weight[:views].view(1, 1, views, -1)
+        pos = self.temporal_position_embedding.weight[-steps:].view(1, steps, 1, -1)
+        tokens = tokens + view_embed + pos
+        tokens = tokens.reshape(batch, steps * views, -1)
+
+        token_mask = None
+        if padding_mask is not None or view_mask is not None:
+            time_mask = (
+                padding_mask[:, -steps:].bool()
+                if padding_mask is not None
+                else torch.zeros(batch, steps, dtype=torch.bool, device=visual_features.device)
+            )
+            view_pad = (
+                ~view_mask.bool()
+                if view_mask is not None
+                else torch.zeros(batch, views, dtype=torch.bool, device=visual_features.device)
+            )
+            token_mask = (time_mask[:, :, None] | view_pad[:, None, :]).reshape(batch, steps * views)
+
+        task_token = self.task_embedding(task_ids.long())[:, None]
+        tokens = torch.cat([task_token, tokens], dim=1)
+        if token_mask is not None:
+            token_mask = torch.cat(
+                [torch.zeros(batch, 1, dtype=torch.bool, device=visual_features.device), token_mask],
+                dim=1,
+            )
+        return self.head(self.encoder(tokens, src_key_padding_mask=token_mask)[:, 0])
 
 
 class SubtaskProgressTransformer(nn.Module):
@@ -86,7 +159,10 @@ class SubtaskProgressTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
         self.progress_head = _Head(config.d_model, config.dropout, sigmoid=True)
-        self.done_head = _Head(config.d_model, config.dropout, sigmoid=False)
+        self.done_head = (
+            None if config.done_verifier_enabled else _Head(config.d_model, config.dropout, sigmoid=False)
+        )
+        self.done_verifier = _DoneVerifier(config) if config.done_verifier_enabled else None
 
     def forward(
         self,
@@ -145,9 +221,14 @@ class SubtaskProgressTransformer(nn.Module):
 
         encoded = self.encoder(tokens, src_key_padding_mask=token_padding_mask)
         task_hidden = encoded[:, 0]
+        if self.done_verifier is not None:
+            done_logit = self.done_verifier(visual_features, task_ids, padding_mask, view_mask)
+        else:
+            assert self.done_head is not None
+            done_logit = self.done_head(task_hidden)
         out = {
             "progress": self.progress_head(task_hidden),
-            "done_logit": self.done_head(task_hidden),
+            "done_logit": done_logit,
             "task_hidden": task_hidden,
         }
         if view_attention is not None:
@@ -208,6 +289,8 @@ class SubtaskProgressTransformer(nn.Module):
             raise ValueError(f"view_mask must be [B,{cfg.num_views}]")
         if cfg.num_views > 1 and view_mask is not None and not bool(view_mask.bool().any(dim=1).all()):
             raise ValueError("each sample must keep at least one view")
+        if cfg.done_verifier_enabled and visual_features.ndim != 4:
+            raise ValueError("done verifier requires visual_features [B,T,V,D]")
         if cfg.num_views == 1 and view_mask is not None and view_mask.numel() > 0:
             raise ValueError("view_mask was provided but num_views=1")
         if task_ids.shape != (batch,):

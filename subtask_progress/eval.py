@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import load_config
+from .diagnostics import summarize_diagnostics, write_diagnostic_plots
 from .metrics import summarize_predictions
 from .model import SubtaskProgressTransformer, SubtaskProgressTransformerConfig
 from .plotting import plot_segment_curves
@@ -23,6 +24,8 @@ def main() -> None:
     parser.add_argument("--split", default="val", choices=["train", "val"])
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--device", default="")
+    parser.add_argument("--mask-view", type=int, default=None)
+    parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -41,8 +44,12 @@ def main() -> None:
         shuffle=False,
         num_workers=int(cfg["training"].get("num_workers", 0)),
     )
-    rows = predict_rows(model, loader, device)
+    rows = predict_rows(model, loader, device, mask_view=args.mask_view)
     metrics = summarize_predictions(rows, cfg["evaluation"].get("done_threshold", 0.5))
+    trigger_threshold = float(cfg["evaluation"].get("done_vote_threshold", 0.9))
+    trigger_window = int(cfg["evaluation"].get("done_vote_window", 10))
+    trigger_votes = int(cfg["evaluation"].get("done_vote_count", 5))
+    diagnostics = summarize_diagnostics(rows, trigger_threshold, trigger_window, trigger_votes)
 
     output_dir = Path(args.output_dir or Path(args.checkpoint).parent / f"eval_{args.split}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -51,8 +58,12 @@ def main() -> None:
     with open(output_dir / "predictions.jsonl", "w") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    plot_segment_curves(rows, output_dir / "curves", cfg["evaluation"].get("num_curve_plots", 8))
-    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    with open(output_dir / "diagnostics.json", "w") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+    if not args.no_plots:
+        plot_segment_curves(rows, output_dir / "curves", cfg["evaluation"].get("num_curve_plots", 8))
+        write_diagnostic_plots(rows, diagnostics, output_dir / "diagnostic_plots")
+    print(json.dumps({"metrics": metrics, "diagnostics": diagnostics["strict"]}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
