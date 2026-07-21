@@ -97,6 +97,8 @@ def main() -> None:
                 batch["proprio"],
                 batch["padding_mask"],
                 batch.get("view_mask"),
+                batch.get("done_visual_features"),
+                batch.get("done_padding_mask"),
             )
             losses = loss_fn(
                 output["progress"],
@@ -201,10 +203,14 @@ def build_dataset(cfg: dict[str, Any], split: str, tiny_overfit: bool = False) -
     feature_roots = ds_cfg.get("feature_roots")
     if isinstance(feature_roots, dict):
         ds_cfg["feature_roots"] = feature_roots.get(split)
+    done_feature_root = ds_cfg.get("done_feature_root")
+    if isinstance(done_feature_root, dict):
+        ds_cfg["done_feature_root"] = done_feature_root.get(split)
     if ds_cfg.get("feature_roots") or int(cfg.get("model", {}).get("num_views") or 1) > 1:
         ds_cfg.setdefault("view_dropout_prob", 0.25)
         ds_cfg["view_dropout_enabled"] = bool(split == "train" and ds_cfg.get("view_dropout_enabled", True))
     ds_cfg.setdefault("history_length", int(cfg["model"]["history_length"]))
+    ds_cfg.setdefault("done_history_length", int(cfg["model"].get("done_history_length", cfg["model"]["history_length"])))
     if tiny_overfit:
         ds_cfg["max_samples"] = int(cfg.get("tiny_overfit", {}).get("max_samples", 32))
         if split == "val":
@@ -213,6 +219,8 @@ def build_dataset(cfg: dict[str, Any], split: str, tiny_overfit: bool = False) -
                 ds_cfg["feature_root"] = cfg["dataset"]["feature_root"].get("train")
             if isinstance(cfg["dataset"].get("feature_roots"), dict):
                 ds_cfg["feature_roots"] = cfg["dataset"]["feature_roots"].get("train")
+            if isinstance(cfg["dataset"].get("done_feature_root"), dict):
+                ds_cfg["done_feature_root"] = cfg["dataset"]["done_feature_root"].get("train")
             if cfg.get("train_dataset", {}).get("done_annotation_path"):
                 ds_cfg["done_annotation_path"] = cfg["train_dataset"]["done_annotation_path"]
     return SubtaskProgressDataset(root=root, **ds_cfg)
@@ -256,6 +264,8 @@ def predict_rows(
                 batch["proprio"],
                 batch["padding_mask"],
                 view_mask,
+                batch.get("done_visual_features"),
+                batch.get("done_padding_mask"),
             )
             done_prob = torch.sigmoid(output["done_logit"])
             done_loss_mask = batch.get("done_loss_mask", torch.ones_like(batch["target_done"]))

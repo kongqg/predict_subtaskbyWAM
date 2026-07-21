@@ -18,6 +18,7 @@ venv/
 outputs/
 runs/
 wandb/
+wandb_runs/
 checkpoints/
 models/
 data/

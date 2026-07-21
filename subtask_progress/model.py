@@ -172,6 +172,8 @@ class SubtaskProgressTransformer(nn.Module):
         proprio: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         view_mask: torch.Tensor | None = None,
+        done_visual_features: torch.Tensor | None = None,
+        done_padding_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Run the model.
 
@@ -182,8 +184,19 @@ class SubtaskProgressTransformer(nn.Module):
             proprio: optional [B, T, proprio_dim].
             padding_mask: optional [B, T], True for padded frames.
             view_mask: optional [B, V], True for usable views.
+            done_visual_features: optional [B, done_T, V, visual_dim] for the done verifier.
+            done_padding_mask: optional [B, done_T], True for padded done frames.
         """
-        self._check_inputs(visual_features, start_visual, task_ids, proprio, padding_mask, view_mask)
+        self._check_inputs(
+            visual_features,
+            start_visual,
+            task_ids,
+            proprio,
+            padding_mask,
+            view_mask,
+            done_visual_features,
+            done_padding_mask,
+        )
         batch, steps = visual_features.shape[:2]
         device = visual_features.device
 
@@ -222,7 +235,12 @@ class SubtaskProgressTransformer(nn.Module):
         encoded = self.encoder(tokens, src_key_padding_mask=token_padding_mask)
         task_hidden = encoded[:, 0]
         if self.done_verifier is not None:
-            done_logit = self.done_verifier(visual_features, task_ids, padding_mask, view_mask)
+            done_logit = self.done_verifier(
+                done_visual_features if done_visual_features is not None else visual_features,
+                task_ids,
+                done_padding_mask if done_padding_mask is not None else padding_mask,
+                view_mask,
+            )
         else:
             assert self.done_head is not None
             done_logit = self.done_head(task_hidden)
@@ -269,6 +287,8 @@ class SubtaskProgressTransformer(nn.Module):
         proprio: torch.Tensor | None,
         padding_mask: torch.Tensor | None,
         view_mask: torch.Tensor | None,
+        done_visual_features: torch.Tensor | None,
+        done_padding_mask: torch.Tensor | None,
     ) -> None:
         cfg = self.config
         if visual_features.ndim not in {3, 4} or visual_features.shape[-1] != cfg.visual_dim:
@@ -291,6 +311,20 @@ class SubtaskProgressTransformer(nn.Module):
             raise ValueError("each sample must keep at least one view")
         if cfg.done_verifier_enabled and visual_features.ndim != 4:
             raise ValueError("done verifier requires visual_features [B,T,V,D]")
+        if done_visual_features is not None:
+            if not cfg.done_verifier_enabled:
+                raise ValueError("done_visual_features requires done_verifier_enabled")
+            if done_visual_features.ndim != 4 or done_visual_features.shape[0] != batch:
+                raise ValueError("done_visual_features must be [B,T,V,D]")
+            if done_visual_features.shape[2:] != (cfg.num_views, cfg.visual_dim):
+                raise ValueError(f"done_visual_features must end with [{cfg.num_views},{cfg.visual_dim}]")
+            if done_visual_features.shape[1] > cfg.done_history_length:
+                raise ValueError(f"done T exceeds done_history_length={cfg.done_history_length}")
+        if done_padding_mask is not None:
+            if done_visual_features is None:
+                raise ValueError("done_padding_mask requires done_visual_features")
+            if done_padding_mask.shape != done_visual_features.shape[:2]:
+                raise ValueError("done_padding_mask must be [B,done_T]")
         if cfg.num_views == 1 and view_mask is not None and view_mask.numel() > 0:
             raise ValueError("view_mask was provided but num_views=1")
         if task_ids.shape != (batch,):

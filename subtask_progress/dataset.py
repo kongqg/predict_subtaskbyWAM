@@ -35,6 +35,8 @@ class SubtaskProgressDataset(Dataset):
         history_length: int,
         feature_root: str | Path | None = None,
         feature_roots: list[str | Path] | None = None,
+        done_feature_root: str | Path | None = None,
+        done_history_length: int | None = None,
         proprio_column: str | None = None,
         task_column: str = "task_index",
         done_column: str | None = None,
@@ -65,6 +67,8 @@ class SubtaskProgressDataset(Dataset):
         self.root = Path(root)
         self.feature_root = Path(feature_root) if feature_root else None
         self.feature_roots = [Path(p) for p in (feature_roots or [])]
+        self.done_feature_root = Path(done_feature_root) if done_feature_root else None
+        self.done_history_length = int(done_history_length or history_length)
         self.visual_column = visual_column
         self.proprio_column = proprio_column or None
         self.task_column = task_column
@@ -95,9 +99,12 @@ class SubtaskProgressDataset(Dataset):
         self._cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
         self._feature_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
         self._feature_view_cache: OrderedDict[tuple[int, int], pd.DataFrame] = OrderedDict()
+        self._done_feature_cache: OrderedDict[int, pd.DataFrame] = OrderedDict()
 
         if self.history_length <= 0:
             raise ValueError("history_length must be > 0")
+        if self.done_history_length <= 0:
+            raise ValueError("done_history_length must be > 0")
         if self.feature_root and self.feature_roots:
             raise ValueError("feature_root and feature_roots are mutually exclusive")
         if self.view_dropout_prob < 0 or self.view_dropout_prob >= 1:
@@ -132,6 +139,7 @@ class SubtaskProgressDataset(Dataset):
         self.parquet_by_episode = self._index_parquets()
         self.feature_by_episode = self._index_features() if self.feature_root else {}
         self.feature_by_view_episode = self._index_feature_roots() if self.feature_roots else []
+        self.done_feature_by_episode = self._index_features(self.done_feature_root) if self.done_feature_root else {}
         self.segments = self._load_segments()
         self.samples = self._build_samples(max_samples)
 
@@ -144,6 +152,7 @@ class SubtaskProgressDataset(Dataset):
         df = self._episode_df(segment.episode_index)
         visual_df = self._feature_df(segment.episode_index) if self.feature_root else df
         visual_dfs = self._feature_view_dfs(segment.episode_index) if self.feature_roots else None
+        done_visual_df = self._done_feature_df(segment.episode_index) if self.done_feature_root else None
 
         raw_indices = self._history_indices(segment, t)
         indices = self._augment_indices(raw_indices)
@@ -153,7 +162,16 @@ class SubtaskProgressDataset(Dataset):
         else:
             visual = self._pad_feature(self._stack_feature(visual_df, self.visual_column, indices))
             start_visual = self._stack_feature(visual_df, self.visual_column, [segment.start])[0]
-        padding_mask = self._padding_mask(len(indices))
+        padding_mask = self._padding_mask(len(indices), self.history_length)
+        if done_visual_df is not None:
+            done_indices = self._tail_indices(segment, t, self.done_history_length)
+            done_visual = self._pad_feature_to(
+                self._stack_feature(done_visual_df, self.visual_column, done_indices), self.done_history_length
+            )
+            done_padding_mask = self._padding_mask(len(done_indices), self.done_history_length)
+        else:
+            done_visual = None
+            done_padding_mask = None
 
         if self.proprio_column:
             proprio_np = self._pad_feature(self._stack_feature(df, self.proprio_column, indices))
@@ -179,6 +197,9 @@ class SubtaskProgressDataset(Dataset):
         }
         if visual.ndim == 3:
             sample["view_mask"] = torch.from_numpy(self._view_mask(visual.shape[1]))
+        if done_visual is not None and done_padding_mask is not None:
+            sample["done_visual_features"] = torch.from_numpy(done_visual)
+            sample["done_padding_mask"] = torch.from_numpy(done_padding_mask)
         return sample
 
     def infer_dims(self) -> tuple[int, int]:
@@ -221,15 +242,16 @@ class SubtaskProgressDataset(Dataset):
                 out[int(row["episode_index"])] = int(row["done_start_frame"])
         return out
 
-    def _index_features(self) -> dict[int, Path]:
-        assert self.feature_root is not None
+    def _index_features(self, root: Path | None = None) -> dict[int, Path]:
+        root = root or self.feature_root
+        assert root is not None
         out: dict[int, Path] = {}
-        for path in sorted((self.feature_root / "data").rglob("episode_*")):
+        for path in sorted((root / "data").rglob("episode_*")):
             stem = path.stem
             if stem.startswith("episode_") and path.suffix in {".parquet", ".npy"}:
                 out[int(stem.split("_")[-1])] = path
         if not out:
-            raise FileNotFoundError(f"no feature files under {self.feature_root / 'data'}")
+            raise FileNotFoundError(f"no feature files under {root / 'data'}")
         return out
 
     def _index_feature_roots(self) -> list[dict[int, Path]]:
@@ -266,6 +288,8 @@ class SubtaskProgressDataset(Dataset):
                 if self.feature_root and episode_index not in self.feature_by_episode:
                     continue
                 if self.feature_roots and any(episode_index not in by_ep for by_ep in self.feature_by_view_episode):
+                    continue
+                if self.done_feature_root and episode_index not in self.done_feature_by_episode:
                     continue
                 sub = (row.get("sub_tasks") or [{}])[0]
                 start = int(sub.get("start", 0))
@@ -342,6 +366,24 @@ class SubtaskProgressDataset(Dataset):
             self._feature_cache.popitem(last=False)
         return df
 
+    def _done_feature_df(self, episode_index: int) -> pd.DataFrame:
+        if episode_index in self._done_feature_cache:
+            self._done_feature_cache.move_to_end(episode_index)
+            return self._done_feature_cache[episode_index]
+        df = self._read_feature_file(self.done_feature_by_episode[episode_index])
+        self._done_feature_cache[episode_index] = df
+        if len(self._done_feature_cache) > self.max_cached_episodes:
+            self._done_feature_cache.popitem(last=False)
+        return df
+
+    def _read_feature_file(self, path: Path) -> pd.DataFrame:
+        if path.suffix == ".npy":
+            arr = np.load(path, mmap_mode="r")
+            return pd.DataFrame(
+                {"frame_index": np.arange(arr.shape[0]), self.visual_column: [arr[i] for i in range(arr.shape[0])]}
+            )
+        return pd.read_parquet(path)
+
     def _feature_view_dfs(self, episode_index: int) -> list[pd.DataFrame]:
         dfs = []
         for view_idx, by_episode in enumerate(self.feature_by_view_episode):
@@ -389,6 +431,10 @@ class SubtaskProgressDataset(Dataset):
             indices.append(t)
         return indices[-self.history_length :]
 
+    def _tail_indices(self, segment: SegmentInfo, t: int, length: int) -> list[int]:
+        start = max(segment.start, t - length + 1)
+        return list(range(start, t + 1))
+
     def _augment_indices(self, indices: list[int]) -> list[int]:
         if not indices:
             return indices
@@ -434,10 +480,13 @@ class SubtaskProgressDataset(Dataset):
         return np.stack(arrays, axis=1).astype(np.float32)
 
     def _pad_feature(self, arr: np.ndarray) -> np.ndarray:
+        return self._pad_feature_to(arr, self.history_length)
+
+    def _pad_feature_to(self, arr: np.ndarray, length: int) -> np.ndarray:
         arr = arr.astype(np.float32)
-        if arr.shape[0] > self.history_length:
-            arr = arr[-self.history_length :]
-        pad = self.history_length - arr.shape[0]
+        if arr.shape[0] > length:
+            arr = arr[-length:]
+        pad = length - arr.shape[0]
         if pad <= 0:
             return arr
         zeros = np.zeros((pad, *arr.shape[1:]), dtype=np.float32)
@@ -456,9 +505,9 @@ class SubtaskProgressDataset(Dataset):
                 mask[self.rng.randrange(num_views)] = True
         return mask
 
-    def _padding_mask(self, valid_len: int) -> np.ndarray:
-        valid_len = min(valid_len, self.history_length)
-        mask = np.ones((self.history_length,), dtype=bool)
+    def _padding_mask(self, valid_len: int, length: int) -> np.ndarray:
+        valid_len = min(valid_len, length)
+        mask = np.ones((length,), dtype=bool)
         mask[-valid_len:] = False
         return mask
 

@@ -109,3 +109,33 @@ def test_independent_done_verifier_outputs_done_logit():
     assert out["progress"].shape == (2,)
     assert out["done_logit"].shape == (2,)
     assert model.done_head is None
+
+
+def test_done_verifier_accepts_separate_done_features():
+    model = SubtaskProgressTransformer(
+        SubtaskProgressTransformerConfig(
+            visual_dim=5,
+            proprio_dim=0,
+            num_tasks=2,
+            num_views=4,
+            history_length=12,
+            d_model=32,
+            num_layers=1,
+            num_heads=4,
+            dim_feedforward=64,
+            dropout=0.0,
+            done_verifier_enabled=True,
+            done_history_length=8,
+        )
+    )
+    out = model(
+        torch.randn(2, 12, 4, 5),
+        torch.randn(2, 4, 5),
+        torch.tensor([0, 1]),
+        padding_mask=torch.zeros(2, 12, dtype=torch.bool),
+        view_mask=torch.ones(2, 4, dtype=torch.bool),
+        done_visual_features=torch.randn(2, 8, 4, 5),
+        done_padding_mask=torch.zeros(2, 8, dtype=torch.bool),
+    )
+    assert out["progress"].shape == (2,)
+    assert out["done_logit"].shape == (2,)

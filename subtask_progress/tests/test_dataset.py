@@ -64,6 +64,16 @@ def _make_feature_root(tmp_path: Path) -> Path:
     return root
 
 
+def _make_done_feature_root(tmp_path: Path) -> Path:
+    root = tmp_path / "done_features"
+    chunk = root / "data" / "chunk-000"
+    chunk.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray([[[1000 + t, 2000 + v] for v in range(4)] for t in range(5)], dtype=np.float32)
+    with open(chunk / "episode_000000.npy", "wb") as f:
+        np.save(f, arr)
+    return root
+
+
 def _make_view_feature_root(tmp_path: Path, view_idx: int, length: int = 5, frame_offset: int = 0) -> Path:
     root = tmp_path / f"features_view_{view_idx}"
     chunk = root / "data" / "chunk-000"
@@ -110,6 +120,22 @@ def test_dataset_reads_external_feature_root(tmp_path):
     valid = ~sample["padding_mask"]
     assert sample["visual_features"][valid, 0].tolist() == [100.0, 101.0, 102.0]
     assert sample["start_visual"].tolist() == [100.0]
+
+
+def test_dataset_reads_short_done_feature_root(tmp_path):
+    ds = SubtaskProgressDataset(
+        _make_root(tmp_path),
+        "visual_features",
+        history_length=3,
+        feature_root=_make_feature_root(tmp_path),
+        done_feature_root=_make_done_feature_root(tmp_path),
+        done_history_length=2,
+    )
+    sample = ds[ds.samples.index((0, 2))]
+    assert sample["visual_features"].shape == (3, 1)
+    assert sample["done_visual_features"].shape == (2, 4, 2)
+    assert sample["done_padding_mask"].tolist() == [False, False]
+    assert sample["done_visual_features"][:, 0, 0].tolist() == [1001.0, 1002.0]
 
 
 def test_done_ignore_window_masks_ambiguous_frames(tmp_path):
